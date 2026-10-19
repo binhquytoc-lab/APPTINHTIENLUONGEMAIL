@@ -2,4 +2,3 @@ streamlit
 pandas
 openpyxl
 reportlab
-supabase>=2.0,<3
