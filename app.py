@@ -5,10 +5,8 @@ from pathlib import Path
 import re
 import unicodedata
 import zipfile
-import uuid
 
 import pandas as pd
-import requests
 import streamlit as st
 from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
@@ -19,126 +17,6 @@ from reportlab.lib.units import mm
 from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
 
 st.set_page_config(page_title="Phần mềm tính tiền lương", page_icon="💰", layout="wide")
-
-
-def lay_cau_hinh_supabase():
-    """Lấy thông tin kết nối Supabase từ Streamlit Secrets."""
-    try:
-        cau_hinh = st.secrets["supabase"]
-        url = str(cau_hinh["url"]).strip().rstrip("/")
-        key = str(cau_hinh["secret_key"]).strip()
-
-        if not url.startswith("https://") or not key:
-            return None
-
-        return {
-            "url": url,
-            "key": key
-        }
-    except (KeyError, FileNotFoundError, AttributeError):
-        return None
-
-
-def tai_pdf_len_supabase(pdf_bytes, duong_dan):
-    """Tải PDF lên Storage riêng tư; không ghi đè tệp đã có."""
-    from urllib.parse import quote
-    cau_hinh = lay_cau_hinh_supabase()
-    if cau_hinh is None:
-        raise ValueError("Chưa cấu hình Supabase")
-    if not isinstance(pdf_bytes, bytes) or not pdf_bytes.startswith(b"%PDF-"):
-        raise ValueError("Dữ liệu PDF không hợp lệ")
-    duong_dan = str(duong_dan).strip().lstrip("/")
-    if not duong_dan or ".." in duong_dan.split("/"):
-        raise ValueError("Đường dẫn PDF không hợp lệ")
-    url = f"{cau_hinh['url']}/storage/v1/object/salary-pdfs/{quote(duong_dan, safe='/')}"
-    try:
-        response = requests.post(
-            url,
-            headers={
-                "apikey": cau_hinh["key"],
-                "Authorization": f"Bearer {cau_hinh['key']}",
-                "Content-Type": "application/pdf",
-                "x-upsert": "false",
-            },
-            data=pdf_bytes,
-            timeout=30,
-        )
-    except requests.RequestException as exc:
-        raise RuntimeError(
-            "Unknown: Không rõ PDF đã được tải lên hay chưa; cần đối soát Storage."
-        ) from exc
-    if response.status_code not in (200, 201):
-        raise RuntimeError(f"Không thể tải PDF lên Supabase: HTTP {response.status_code}")
-    return duong_dan
-
-
-def chuan_hoa_so_zalo(so_dien_thoai):
-    """Chuẩn hóa số điện thoại Việt Nam để tìm kiếm Zalo."""
-    if pd.isna(so_dien_thoai):
-        return None
-
-    so = str(so_dien_thoai).strip()
-
-    # Loại bỏ khoảng trắng, dấu chấm và dấu gạch ngang
-    so = re.sub(r"[\s.\-()]", "", so)
-
-    # Chuyển đầu số quốc tế +84 hoặc 84 thành 0
-    if so.startswith("+84"):
-        so = "0" + so[3:]
-    elif so.startswith("84") and len(so) == 11:
-        so = "0" + so[2:]
-
-    # Kiểm tra số di động Việt Nam gồm 10 chữ số
-    if not re.fullmatch(r"0[35789]\d{8}", so):
-        return None
-
-    return so
-
-def tao_cong_viec_zalo(batch_id, ho_ten, so_zalo, ky_luong, pdf_path):
-    """Tạo công việc chờ Windows Agent, không tự gửi qua Zalo."""
-    cau_hinh = lay_cau_hinh_supabase()
-    if cau_hinh is None:
-        raise ValueError("Chưa cấu hình Supabase")
-    payload = {
-        "batch_id": str(batch_id),
-        "employee_name": str(ho_ten).strip(),
-        "zalo_phone": str(so_zalo).strip(),
-        "salary_period": str(ky_luong).strip(),
-        "pdf_path": str(pdf_path).strip(),
-        "status": "Pending",
-    }
-    try:
-        response = requests.post(
-            f"{cau_hinh['url']}/rest/v1/zalo_salary_jobs",
-            headers={
-                "apikey": cau_hinh["key"],
-                "Authorization": f"Bearer {cau_hinh['key']}",
-                "Content-Type": "application/json",
-                "Prefer": "return=representation",
-            },
-            json=payload,
-            timeout=20,
-        )
-    except requests.RequestException as exc:
-        raise RuntimeError(
-            "Unknown: Không xác định được Supabase đã tạo công việc hay chưa; "
-            "cần đối soát trước khi thử lại."
-        ) from exc
-    if response.status_code == 409:
-        raise RuntimeError(
-            "Công việc đã tồn tại cho số Zalo và kỳ lương này; không tạo lại."
-        )
-    if response.status_code != 201:
-        raise RuntimeError(f"Không thể tạo công việc Zalo: HTTP {response.status_code}")
-    try:
-        data = response.json()
-        if not isinstance(data, list) or not data or not data[0].get("id"):
-            raise ValueError("Phản hồi thiếu ID")
-        return data[0]["id"]
-    except (ValueError, TypeError, KeyError) as exc:
-        raise RuntimeError(
-            "Unknown: Supabase có thể đã tạo công việc nhưng phản hồi không đầy đủ; cần đối soát."
-        ) from exc
 
 
 MAX_NV = 500
@@ -426,152 +304,6 @@ with st.expander("📘 Công thức tính lương đang áp dụng"):
     """)
 
 
-# ------------------- HANG DOI GUI ZALO -------------------
-if "ket_qua" in st.session_state:
-    st.divider()
-    st.subheader("📤 Gửi phiếu lương PDF qua Zalo")
-
-    df_zalo = st.session_state.ket_qua
-    ky_zalo = st.session_state.get("ky_da_tinh", ky_luong)
-
-    st.caption(
-        "Tạo PDF và đưa vào Supabase. "
-        "Windows Agent sẽ thực hiện gửi qua Zalo PC sau."
-    )
-
-    dau_vao_zalo = (
-        st.session_state.nhan_vien.iloc[:so_nv][COT_NHAP]
-        .reset_index(drop=True)
-    )
-    da_tinh_zalo = df_zalo[COT_NHAP].reset_index(drop=True)
-
-    du_lieu_cu = (
-        len(dau_vao_zalo) != len(da_tinh_zalo)
-        or not dau_vao_zalo.equals(da_tinh_zalo)
-        or ky_luong != ky_zalo
-    )
-
-    if du_lieu_cu:
-        st.warning("Dữ liệu đã thay đổi. Hãy TÍNH LƯƠNG lại.")
-
-    xac_nhan_zalo = st.checkbox(
-        "Tôi xác nhận danh sách người nhận và đồng ý tạo "
-        "công việc gửi phiếu lương qua Zalo.",
-        key="xac_nhan_hang_doi_zalo"
-    )
-
-    # Chống tạo lại hàng đợi trong cùng phiên Streamlit
-    if "dot_zalo_da_tao" not in st.session_state:
-        st.session_state.dot_zalo_da_tao = False
-
-    if st.button(
-        "📤 ĐƯA PHIẾU LƯƠNG VÀO HÀNG ĐỢI ZALO",
-        disabled=(
-            du_lieu_cu
-            or not xac_nhan_zalo
-            or st.session_state.dot_zalo_da_tao
-            or df_zalo.empty
-        ),
-        use_container_width=True
-    ):
-        # Khóa tạo lại hàng đợi ngay khi bắt đầu xử lý
-        st.session_state.dot_zalo_da_tao = True        
-        batch_id = str(uuid.uuid4())
-        bao_cao_zalo = []
-        so_zalo_da_xu_ly = set()
-        thanh_cong = 0
-        loi = 0
-
-        progress = st.progress(0)
-
-        for i, (_, nv) in enumerate(df_zalo.iterrows(), start=1):
-            ten = str(nv["Họ và tên"]).strip()
-            so = chuan_hoa_so_zalo(nv["Số điện thoại Zalo"])
-            trang_thai = "Pending"
-            ghi_chu = ""
-
-            if not so:
-                trang_thai = "Error"
-                ghi_chu = "Số điện thoại Zalo không hợp lệ"
-                loi += 1
-
-            elif so in so_zalo_da_xu_ly:
-                trang_thai = "Error"
-                ghi_chu = "Số điện thoại Zalo bị trùng trong đợt"
-                loi += 1
-
-            else:
-                so_zalo_da_xu_ly.add(so)
-                try:
-                    pdf = tao_pdf(nv, ky_zalo)
-
-                    pdf_path = (
-                        f"{batch_id}/"
-                        f"{i:03d}_{uuid.uuid4().hex}.pdf"
-                    )
-
-                    tai_pdf_len_supabase(pdf, pdf_path)
-
-                    tao_cong_viec_zalo(
-                        batch_id=batch_id,
-                        ho_ten=ten,
-                        so_zalo=so,
-                        ky_luong=ky_zalo,
-                        pdf_path=pdf_path
-                    )
-
-                    thanh_cong += 1
-
-                except (requests.RequestException, ValueError,
-                        RuntimeError, OSError) as exc:
-                    ghi_chu = f"{type(exc).__name__}: {str(exc)[:200]}"
-
-                    if str(exc).startswith("Unknown:"):
-                        trang_thai = "Unknown"
-                    else:
-                        trang_thai = "Error"
-
-                    loi += 1
-
-            bao_cao_zalo.append({
-                "STT": i,
-                "Họ và tên": ten,
-                "Số điện thoại Zalo": so or "",
-                "Trạng thái": trang_thai,
-                "Ghi chú": ghi_chu
-            })
-
-            progress.progress(i / len(df_zalo))
-
-        st.session_state["bao_cao_hang_doi_zalo"] = pd.DataFrame(
-            bao_cao_zalo
-        )
-        st.session_state["batch_id_zalo"] = batch_id
-                
-        # Khóa việc tạo lại đợt sau khi đã thực hiện
-        # kể cả khi kết quả có lỗi hoặc chưa xác định
-        st.session_state.dot_zalo_da_tao = True
-        st.success(
-            f"Đã tạo {thanh_cong} công việc Pending. "
-            f"Có {loi} nhân viên chưa đưa vào hàng đợi."
-        )
-
-    if "bao_cao_hang_doi_zalo" in st.session_state:
-        st.markdown("**Báo cáo tạo hàng đợi Zalo**")
-        bao_cao = st.session_state["bao_cao_hang_doi_zalo"]
-        st.dataframe(
-            bao_cao,
-            hide_index=True,
-            use_container_width=True
-        )
-
-        st.download_button(
-            "📥 TẢI BÁO CÁO CSV",
-            data=bao_cao.to_csv(index=False).encode("utf-8-sig"),
-            file_name="bao_cao_hang_doi_zalo.csv",
-            mime="text/csv"
-        )
-
 # ------------------- GUI PHIEU LUONG QUA GMAIL -------------------
 # Bao mat: chi doc thong tin dang nhap tu Streamlit Secrets.
 import smtplib
@@ -635,8 +367,8 @@ def tao_bao_cao_gui(rows):
 
 if "ket_qua" in st.session_state:
     st.divider()
-    st.subheader("6. Gửi phiếu lương PDF qua Gmail cá nhân")
-    st.caption("Chỉ gửi khi bạn bấm xác nhận. Mỗi thư chỉ đính kèm phiếu lương của đúng một nhân viên. PDF hiện là tiếng Việt không dấu.")
+    st.subheader("5. Gửi phiếu lương PDF qua Gmail cá nhân")
+    st.caption("Không cần Supabase. Chỉ gửi khi bạn bấm xác nhận; mỗi email chỉ đính kèm phiếu lương PDF của đúng một nhân viên. PDF hiện là tiếng Việt không dấu.")
 
     df_mail = st.session_state.ket_qua
     ky_mail = st.session_state.get("ky_da_tinh", ky_luong)
@@ -653,7 +385,7 @@ if "ket_qua" in st.session_state:
 
     cau_hinh = lay_cau_hinh_gmail()
     if cau_hinh is None:
-        st.warning("Chưa cấu hình Gmail. Hãy thêm [gmail] vào Streamlit Secrets (xem hướng dẫn bên dưới). Không nhập mật khẩu trong app.py.")
+        st.warning("Chưa cấu hình Gmail. Hãy thêm [gmail] vào Streamlit Secrets (xem hướng dẫn bên dưới). Không nhập mật khẩu vào app.py.")
     else:
         st.success(f"Tài khoản gửi đã cấu hình: {cau_hinh['address']}")
 
@@ -755,33 +487,3 @@ if "ket_qua" in st.session_state:
         st.download_button("📥 Tải báo cáo CSV", bao_cao.to_csv(index=False).encode("utf-8-sig"),
                            file_name="bao_cao_gui_phieu_luong.csv", mime="text/csv")
         st.caption("Báo cáo chỉ tồn tại trong phiên làm việc này. Không tự gửi lại email đã được SMTP chấp nhận trong cùng đợt.")
-
-
-# KIỂM TRA KẾT NỐI SUPABASE
-with st.expander("🔗 Kiểm tra kết nối Supabase"):
-    try:
-        import requests
-
-        sb = st.secrets["supabase"]
-        url = str(sb["url"]).strip().rstrip("/")
-        key = str(sb["secret_key"]).strip()
-
-        response = requests.get(
-            f"{url}/rest/v1/zalo_salary_jobs",
-            headers={
-                "apikey": key,
-                "Authorization": f"Bearer {key}"
-            },
-            params={"select": "id", "limit": "1"},
-            timeout=15
-        )
-
-        if response.status_code == 200:
-            st.success("OK - Đã kết nối thành công với Supabase")
-        else:
-            st.error(
-                f"Error - Supabase trả về HTTP {response.status_code}"
-            )
-
-    except Exception as e:
-        st.error(f"Error - {type(e).__name__}")
